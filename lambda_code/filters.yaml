@@ -18,7 +18,6 @@ on-prem-filtering:
     - Lytx.Services.VirtualOdometer
   tag: on-prem-alert
 
-
 cloud-filtering:
   condition: "contains"
   condition_type: input-tag
@@ -599,4 +598,3 @@ kafka_filtering:
     - aws.kafka.Topic
     - aws.kafka.ConsumerGroup
   tag: kafka-alert
-
