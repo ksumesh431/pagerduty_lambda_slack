@@ -2,7 +2,7 @@ on-prem-filtering:
   condition: "contains"
   condition_type: input-tag
   filter-against:
-    - title
+    - description
   keys:
     - Onprem
     - onprem
@@ -22,7 +22,7 @@ cloud-filtering:
   condition: "contains"
   condition_type: input-tag
   filter-against:
-    - title
+    - description
   keys:
     - aws
     - 802-testing

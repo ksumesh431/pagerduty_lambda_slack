@@ -160,14 +160,16 @@ def find_values_by_key(data, target_key):
 
 
 # --- Function to Process Alerts with Filters ---
+# --- Function to Process Alerts with Filters (Revised to store input-tag matches) ---
 def process_alerts_with_filters(alerts, filters):
     """
     Processes alerts based on filter rules defined in the filters dictionary.
     Handles simple strings, lists of objects, and direct objects found via
     recursive search for filter-against keys.
+    Stores matched keywords for input-tag types in grouped_details.
     """
     final_tags = set()
-    grouped_details = {}
+    grouped_details = {}  # Will store details for BOTH condition types now
     tag_added_flags = {filter_name: False for filter_name in filters}
 
     if not alerts:
@@ -177,12 +179,8 @@ def process_alerts_with_filters(alerts, filters):
     for filter_name, config in filters.items():
         condition = config.get("condition")
         condition_type = config.get("condition_type")
-        filter_against_list = config.get(
-            "filter-against", []
-        )  # e.g., ["description", "contexts", "labels"]
-        keys_to_match = config.get(
-            "keys", []
-        )  # e.g., ["Lytx.DeviceWake.Api", "href", "k8s.namespaceName"]
+        filter_against_list = config.get("filter-against", [])
+        keys_to_match = config.get("keys", [])
         tag = config.get("tag")
 
         if not all(
@@ -192,97 +190,92 @@ def process_alerts_with_filters(alerts, filters):
             continue
 
         for alert in alerts:
-            # Optimization: If tag already added for this filter, skip processing this alert *for this filter*
-            # We only need to add the tag once per filter definition.
-            # For fetch-output-with-tag, we might miss some key-values if we skip early.
-            # Let's refine this: only skip if the tag is added AND it's an input-tag type.
-            # For fetch-output, we need to gather all KVs.
+            # Optimization: Skip input-tag checks if tag already added
             if tag_added_flags[filter_name] and condition_type == "input-tag":
-                continue  # Already added this input-tag, move to next alert for this filter
+                continue
 
-            match_found_in_alert_for_filter = False
+            match_found_in_alert_for_filter = False  # Reset for each alert/filter combo
 
-            for (
-                field_to_search
-            ) in filter_against_list:  # e.g., "description", "contexts", "labels"
-                # Use the general recursive search
+            for field_to_search in filter_against_list:
                 found_values = find_values_by_key(alert, field_to_search)
 
-                for value in found_values:  # Value could be str, list, dict, etc.
+                for value in found_values:
 
                     # --- Handle 'input-tag' ---
                     if condition_type == "input-tag":
-                        # Case 1: Value is a string (e.g., found "description": "string")
+                        matched_key_for_this_value = (
+                            None  # Track which key matched this specific value
+                        )
+
+                        # Case 1: Value is a string
                         if isinstance(value, str):
                             if condition == "contains":
                                 for key in keys_to_match:
                                     if key in value:
-                                        if not tag_added_flags[filter_name]:
-                                            final_tags.add(tag)
-                                            tag_added_flags[filter_name] = True
-                                        match_found_in_alert_for_filter = True
-                                        break  # Key matched in string
-                        # Case 2: Value is a list (e.g., found "contexts": [...])
+                                        matched_key_for_this_value = (
+                                            key  # Store the key that matched
+                                        )
+                                        break  # Found the first matching key for this string value
+                        # Case 2: Value is a list
                         elif isinstance(value, list):
                             for item in value:
-                                # Assume items in list are dicts we want to check keys in
                                 if isinstance(item, dict):
-                                    for key_to_find in keys_to_match:  # e.g., "href"
-                                        if (
-                                            key_to_find in item
-                                        ):  # Check if key exists in the dict item
-                                            if not tag_added_flags[filter_name]:
-                                                final_tags.add(tag)
-                                                tag_added_flags[filter_name] = True
-                                            match_found_in_alert_for_filter = True
-                                            break  # Key found in list item
-                                if match_found_in_alert_for_filter:
-                                    break  # Matched in list
-                        # Add other type handlers if needed (e.g., dict directly for input-tag?)
+                                    for key_to_find in keys_to_match:
+                                        if key_to_find in item:
+                                            # Here, the 'key' that matched is key_to_find (the key existing in the dict)
+                                            matched_key_for_this_value = key_to_find
+                                            break  # Found the first matching key within this dict item
+                                if matched_key_for_this_value:
+                                    break  # Found match in list item
+
+                        # If a key matched for this value (string or list item)
+                        if matched_key_for_this_value:
+                            # Add the tag if it's the first time for this filter
+                            if not tag_added_flags[filter_name]:
+                                final_tags.add(tag)
+                                tag_added_flags[filter_name] = True
+
+                            # Add the matched keyword to grouped_details for this tag
+                            grouped_details.setdefault(tag, [])
+                            # Add a prefix for clarity, or just the key itself
+                            detail_string = (
+                                f"Matched Keyword: {matched_key_for_this_value}"
+                            )
+                            # Avoid adding duplicates if the same keyword matches multiple times for the same tag
+                            if detail_string not in grouped_details[tag]:
+                                grouped_details[tag].append(detail_string)
+
+                            match_found_in_alert_for_filter = True
+                            # Break from iterating found_values for this field_to_search
+                            # because we found a match and recorded it for this input-tag filter.
+                            break
 
                     # --- Handle 'fetch-output-with-tag' ---
                     elif condition_type == "fetch-output-with-tag":
+                        # (Keep the existing logic for fetch-output-with-tag exactly as it was)
                         objects_to_process = []
-                        # Case 1: Value is a dictionary (e.g., found "labels": {...})
                         if isinstance(value, dict):
                             objects_to_process.append(value)
-                        # Case 2: Value is a list (e.g., found "contexts": [...] or "targets": [...])
                         elif isinstance(value, list):
                             for item in value:
-                                # Add dictionary items from the list to be processed
                                 if isinstance(item, dict):
                                     objects_to_process.append(item)
 
-                        # Process the collected dictionary objects
                         for obj in objects_to_process:
-                            for (
-                                key_to_extract
-                            ) in keys_to_match:  # e.g., "href", "k8s.namespaceName"
+                            for key_to_extract in keys_to_match:
                                 if key_to_extract in obj:
-                                    # Add tag if not already added for this filter
                                     if not tag_added_flags[filter_name]:
                                         final_tags.add(tag)
                                         tag_added_flags[filter_name] = True
-
-                                    # Initialize list for the tag if needed
                                     grouped_details.setdefault(tag, [])
-                                    # Format and add the key-value string if not present
                                     detail_string = (
                                         f"{key_to_extract} = {obj[key_to_extract]}"
                                     )
                                     if detail_string not in grouped_details[tag]:
                                         grouped_details[tag].append(detail_string)
-                                    # We found a key to extract, but don't set match_found_in_alert_for_filter
-                                    # because we need to potentially extract *multiple* keys from this object
-                                    # and check other objects/values found for this field_to_search.
+                                    # Don't set match_found_in_alert_for_filter here for fetch-output
 
-                    # Break from iterating through found_values if a match added the tag (for input-tag)
-                    if (
-                        match_found_in_alert_for_filter
-                        and condition_type == "input-tag"
-                    ):
-                        break
-                # Break from iterating through filter_against_list if a match added the tag (for input-tag)
+                # Break from iterating filter_against_list if an input-tag match was found and recorded
                 if match_found_in_alert_for_filter and condition_type == "input-tag":
                     break
 

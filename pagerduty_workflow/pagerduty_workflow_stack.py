@@ -49,7 +49,7 @@ class PagerdutyWorkflowStack(Stack):
         # Lambda function (code in lambda_code directory)
         lambda_function = lambda_.Function(
             self,
-            "PagerdutyWorkflowLambda",
+            "Pagerduty_Workflow",
             runtime=lambda_.Runtime.PYTHON_3_13,
             code=lambda_.Code.from_asset("lambda_code"),
             handler="index.lambda_handler",
