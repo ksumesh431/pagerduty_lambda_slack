@@ -6,14 +6,6 @@ import os
 import traceback
 from botocore.exceptions import ClientError
 
-
-# incident_id = "Q0WVUWIXVOP2A8"   #Kafka
-# incident_id = "Q0J4J46HFZRNHF"   # windows alert
-# incident_id = "Q3NERHR7A7W9H4"  #k8s alert
-# incident_id = "Q16HWF43U1YMGP"  # no tag match
-# incident_id = "Q06VIQYR27094T"
-
-
 # Define the secret name
 SECRET_NAME_PAGERDUTY_API_KEY = "pagerduty/API_KEY"
 SECRET_NAME_SLACK_WEBHOOK = "pagerduty/SLACK_WEBHOOK"
@@ -49,8 +41,8 @@ def get_secret(secret_name):
 API_KEY_JSON = get_secret(SECRET_NAME_PAGERDUTY_API_KEY)
 API_KEY = json.loads(API_KEY_JSON)["API_KEY"]
 
-PAGERDUTY_JSON = get_secret(SECRET_NAME_SLACK_WEBHOOK)
-SLACK_WEBHOOK = json.loads(PAGERDUTY_JSON)["WEBHOOK"]
+SLACK_JSON = get_secret(SECRET_NAME_SLACK_WEBHOOK)
+SLACK_WEBHOOK = json.loads(SLACK_JSON)["WEBHOOK"]
 
 # Common headers for all API calls
 HEADERS = {
@@ -62,63 +54,33 @@ HEADERS = {
 BASE_URL = "https://api.pagerduty.com"
 
 
-def get_incident(incident_id):
-
-    url = f"{BASE_URL}/incidents/{incident_id}"
-    try:
-        response = requests.get(url, headers=HEADERS)
-        response.raise_for_status()
-        return response.json()  # Parsed incident JSON
-    except requests.exceptions.HTTPError as errh:
-        print(f"HTTP Error: {errh}")
-    except requests.exceptions.ConnectionError as errc:
-        print(f"Connection Error: {errc}")
-    except requests.exceptions.Timeout as errt:
-        print(f"Timeout Error: {errt}")
-    except requests.exceptions.RequestException as err:
-        print(f"Error: {err}")
-    return None
-
-
+# --- PagerDuty API Functions ---
 def get_incident_alerts(incident_id):
-    """
-    Fetch alerts associated with an incident.
-    """
+    """Fetch alerts associated with an incident."""
+    if not API_KEY:
+        print("Error: PagerDuty API_KEY is not set.")
+        return None
     url = f"{BASE_URL}/incidents/{incident_id}/alerts"
-    params = {"limit": 100}  # Adjust as needed.
+    params = {"limit": 100}
     try:
         response = requests.get(url, headers=HEADERS, params=params)
         response.raise_for_status()
-        return response.json()  # Parsed alerts JSON
+        return response.json()
     except requests.exceptions.HTTPError as errh:
-        print(f"HTTP Error: {errh}")
+        print(f"HTTP Error fetching alerts for {incident_id}: {errh}")
+        print(f"Response Body: {response.text}")
     except requests.exceptions.ConnectionError as errc:
-        print(f"Connection Error: {errc}")
+        print(f"Connection Error fetching alerts for {incident_id}: {errc}")
     except requests.exceptions.Timeout as errt:
-        print(f"Timeout Error: {errt}")
+        print(f"Timeout Error fetching alerts for {incident_id}: {errt}")
     except requests.exceptions.RequestException as err:
-        print(f"Error: {err}")
+        print(f"Error fetching alerts for {incident_id}: {err}")
     return None
 
 
-def load_filters(file_path):
-    """
-    Load and return filtering configuration from a YAML file.
-    """
-    try:
-        with open(file_path, "r") as stream:
-            filters = yaml.safe_load(stream)
-        return filters
-    except FileNotFoundError:
-        print(f"The file {file_path} was not found.")
-    except yaml.YAMLError as ye:
-        print("Error parsing YAML file:", ye)
-    return None
-
-
+# --- Alert Data Extraction Functions ---
 def extract_alert_info(alert):
-    labels_collected = {}
-    # Include new fields
+    """Extracts additional details from a single alert's body."""
     additional = {
         "incident_url": "N/A",
         "policy_url": "N/A",
@@ -127,166 +89,204 @@ def extract_alert_info(alert):
         "condition_name": "N/A",
         "details": "N/A",
     }
-    details = {}
+    details_source = {}
 
     # Dig into the alert body safely
     if "body" in alert and isinstance(alert["body"], dict):
         body = alert["body"]
-        # print(json.dumps(body, indent=4))
         # First try from cef_details -> details
         cef_details = body.get("cef_details", {})
         if isinstance(cef_details, dict):
-            details = cef_details.get("details", {})
+            details_source = cef_details.get("details", {})
 
-        # Fallback to body["details"] if not found
-        if not details and "details" in body:
-            details = body.get("details", {})
+        # Fallback to body["details"] if not found in cef_details
+        if (
+            not details_source
+            and "details" in body
+            and isinstance(body["details"], dict)
+        ):
+            details_source = body.get("details", {})
+        # Handle case where body.details might be a string directly
+        elif (
+            not details_source
+            and "details" in body
+            and isinstance(body["details"], str)
+        ):
+            additional["details"] = body["details"]  # Assign directly if it's a string
 
-    # Collect labels from targets list (inside details)
-    targets = details.get("targets", [])
-    if isinstance(targets, list):
-        for target in targets:
-            target_labels = target.get("labels", {})
-            if isinstance(target_labels, dict):
-                labels_collected.update(target_labels)
-
-    # Extract all additional fields (old + new)
+    # Populate 'additional' dict from the found details_source
     for key in additional:
-        if key in details and details.get(key) is not None:
-            additional[key] = details.get(key)
-    # print(additional)
-    return labels_collected, additional
+        # Only update if not already set (e.g., by direct string assignment above)
+        # and if the key exists in details_source and has a non-None value
+        if (
+            additional[key] == "N/A"
+            and key in details_source
+            and details_source.get(key) is not None
+        ):
+            additional[key] = details_source.get(key)
+
+    return additional
 
 
-def process_filters_details(incident, alerts_info, filters):
+def find_values_by_key(data, target_key):
+    """
+    Recursively searches for ALL values associated with a specific key
+    within a nested data structure. Uses DFS.
+
+    Args:
+        data: The dictionary or list to search within.
+        target_key (str): The key whose values we are looking for.
+
+    Returns:
+        list: A list of all values (could be strings, lists, dicts, etc.)
+              found associated with the target_key.
+    """
+    found_values = []
+
+    def recurse(item):
+        if isinstance(item, dict):
+            for key, value in item.items():
+                if key == target_key:
+                    # Add the value regardless of its type
+                    found_values.append(value)
+                # Always recurse deeper into the value
+                recurse(value)
+        elif isinstance(item, list):
+            for element in item:
+                recurse(element)
+
+    recurse(data)
+    return found_values
+
+
+# --- Function to Process Alerts with Filters ---
+def process_alerts_with_filters(alerts, filters):
+    """
+    Processes alerts based on filter rules defined in the filters dictionary.
+    Handles simple strings, lists of objects, and direct objects found via
+    recursive search for filter-against keys.
+    """
     final_tags = set()
-    match_details = {}
+    grouped_details = {}
+    tag_added_flags = {filter_name: False for filter_name in filters}
 
-    # Process "input-tag" filters using incident fields dynamically
-    # print(json.dumps(incident, indent=4))
-    for filt in filters.values():
-        if filt.get("condition_type") == "input-tag":
-            cond = filt.get("condition")
-            against = filt.get("filter-against", [])
-            values = filt.get("values", [])
-            tag = filt.get("tag")
-            matched_values = []
+    if not alerts:
+        print("Warning: No alerts provided for processing.")
+        return [], {}
 
-            for field in against:
-                incident_value = incident.get(field, "")
-                if cond == "contains" and isinstance(incident_value, str):
-                    for value in values:
-                        if value in incident_value:
-                            matched_values.append(value)
+    for filter_name, config in filters.items():
+        condition = config.get("condition")
+        condition_type = config.get("condition_type")
+        filter_against_list = config.get(
+            "filter-against", []
+        )  # e.g., ["description", "contexts", "labels"]
+        keys_to_match = config.get(
+            "keys", []
+        )  # e.g., ["Lytx.DeviceWake.Api", "href", "k8s.namespaceName"]
+        tag = config.get("tag")
 
-            if matched_values:
-                final_tags.add(tag)
-                match_details[tag] = list(set(matched_values))
+        if not all(
+            [condition, condition_type, filter_against_list, keys_to_match, tag]
+        ):
+            print(f"Warning: Skipping filter '{filter_name}' due to missing config.")
+            continue
 
-    # Process "fetch-output-with-tag" filters over all alerts
-    for filt in filters.values():
-        if filt.get("condition_type") == "fetch-output-with-tag":
-            cond = filt.get("condition")
-            values = filt.get("values", [])
-            tag = filt.get("tag")
-            matched_items = []
+        for alert in alerts:
+            # Optimization: If tag already added for this filter, skip processing this alert *for this filter*
+            # We only need to add the tag once per filter definition.
+            # For fetch-output-with-tag, we might miss some key-values if we skip early.
+            # Let's refine this: only skip if the tag is added AND it's an input-tag type.
+            # For fetch-output, we need to gather all KVs.
+            if tag_added_flags[filter_name] and condition_type == "input-tag":
+                continue  # Already added this input-tag, move to next alert for this filter
 
-            if cond == "contains":
-                for alert_info in alerts_info:
-                    # print(json.dumps(alerts_info, indent=4))
-                    labels = alert_info.get("labels", {})
-                    for label_key, label_value in labels.items():
-                        for fval in values:
-                            if fval in label_key:
-                                matched_items.append(f"{label_key} = {label_value}")
-            if matched_items:
-                final_tags.add(tag)
-                match_details[tag] = list(set(matched_items))
+            match_found_in_alert_for_filter = False
 
-    # Pull incident metadata from the first alert_info dict (if present)
-    alert_source = alerts_info[0] if alerts_info else {}
+            for (
+                field_to_search
+            ) in filter_against_list:  # e.g., "description", "contexts", "labels"
+                # Use the general recursive search
+                found_values = find_values_by_key(alert, field_to_search)
 
-    # Metadata keys to extract
-    meta_keys = [
-        "incident_url",
-        "policy_url",
-        "severity",
-        "runbook_url",
-        "condition_name",
-        "details",
-    ]
+                for value in found_values:  # Value could be str, list, dict, etc.
 
-    for key in meta_keys:
-        match_details[key] = alert_source.get(
-            key, f"Pagerduty incident missing value for {key}"
-        )
+                    # --- Handle 'input-tag' ---
+                    if condition_type == "input-tag":
+                        # Case 1: Value is a string (e.g., found "description": "string")
+                        if isinstance(value, str):
+                            if condition == "contains":
+                                for key in keys_to_match:
+                                    if key in value:
+                                        if not tag_added_flags[filter_name]:
+                                            final_tags.add(tag)
+                                            tag_added_flags[filter_name] = True
+                                        match_found_in_alert_for_filter = True
+                                        break  # Key matched in string
+                        # Case 2: Value is a list (e.g., found "contexts": [...])
+                        elif isinstance(value, list):
+                            for item in value:
+                                # Assume items in list are dicts we want to check keys in
+                                if isinstance(item, dict):
+                                    for key_to_find in keys_to_match:  # e.g., "href"
+                                        if (
+                                            key_to_find in item
+                                        ):  # Check if key exists in the dict item
+                                            if not tag_added_flags[filter_name]:
+                                                final_tags.add(tag)
+                                                tag_added_flags[filter_name] = True
+                                            match_found_in_alert_for_filter = True
+                                            break  # Key found in list item
+                                if match_found_in_alert_for_filter:
+                                    break  # Matched in list
+                        # Add other type handlers if needed (e.g., dict directly for input-tag?)
 
-    return final_tags, match_details
+                    # --- Handle 'fetch-output-with-tag' ---
+                    elif condition_type == "fetch-output-with-tag":
+                        objects_to_process = []
+                        # Case 1: Value is a dictionary (e.g., found "labels": {...})
+                        if isinstance(value, dict):
+                            objects_to_process.append(value)
+                        # Case 2: Value is a list (e.g., found "contexts": [...] or "targets": [...])
+                        elif isinstance(value, list):
+                            for item in value:
+                                # Add dictionary items from the list to be processed
+                                if isinstance(item, dict):
+                                    objects_to_process.append(item)
 
+                        # Process the collected dictionary objects
+                        for obj in objects_to_process:
+                            for (
+                                key_to_extract
+                            ) in keys_to_match:  # e.g., "href", "k8s.namespaceName"
+                                if key_to_extract in obj:
+                                    # Add tag if not already added for this filter
+                                    if not tag_added_flags[filter_name]:
+                                        final_tags.add(tag)
+                                        tag_added_flags[filter_name] = True
 
-def pretty_print_output(match_details, final_tags):
+                                    # Initialize list for the tag if needed
+                                    grouped_details.setdefault(tag, [])
+                                    # Format and add the key-value string if not present
+                                    detail_string = (
+                                        f"{key_to_extract} = {obj[key_to_extract]}"
+                                    )
+                                    if detail_string not in grouped_details[tag]:
+                                        grouped_details[tag].append(detail_string)
+                                    # We found a key to extract, but don't set match_found_in_alert_for_filter
+                                    # because we need to potentially extract *multiple* keys from this object
+                                    # and check other objects/values found for this field_to_search.
 
-    # Create the slack_output_dict
-    slack_output_dict = {"tags": final_tags, "details": match_details}
+                    # Break from iterating through found_values if a match added the tag (for input-tag)
+                    if (
+                        match_found_in_alert_for_filter
+                        and condition_type == "input-tag"
+                    ):
+                        break
+                # Break from iterating through filter_against_list if a match added the tag (for input-tag)
+                if match_found_in_alert_for_filter and condition_type == "input-tag":
+                    break
 
-    return slack_output_dict
-
-
-def format_output_for_slack(slack_output_dict):
-    output_lines = []
-
-    # Extract data
-    match_details = slack_output_dict.get("details", {})
-    final_tags = slack_output_dict.get("tags", set())
-
-    # Get main incident details
-    incident_url = match_details.get(
-        "incident_url", "Pagerduty incident missing value for incident_url"
-    )
-    policy_url = match_details.get(
-        "policy_url", "Pagerduty incident missing value for policy_url"
-    )
-    severity = match_details.get(
-        "severity", "Pagerduty incident missing value for severity"
-    )
-    runbook_url = match_details.get(
-        "runbook_url", "Pagerduty incident missing value for runbook_url"
-    )
-    condition_name = match_details.get(
-        "condition_name", "Pagerduty incident missing value for condition_name"
-    )
-    description = match_details.get(
-        "details", "Pagerduty incident missing value for alert details"
-    )
-
-    # Alert description at the top as heading
-    output_lines.append(f"{description}")
-    output_lines.append("-" * 60)
-
-    # Header section
-    output_lines.append(f"[INCIDENT URL]    : {incident_url}")
-    output_lines.append(f"[POLICY URL]      : {policy_url}")
-    output_lines.append(f"[SEVERITY]        : {severity}")
-    output_lines.append(f"[CONDITION NAME]  : {condition_name}")
-    output_lines.append("-" * 60)
-
-    # Tag match section
-    if final_tags:
-        output_lines.append("Tag Matches:")
-        for tag in sorted(final_tags):
-            output_lines.append(f"  [Tag: {tag}]")
-            matched_items = match_details.get(tag, [])
-            for item in matched_items:
-                output_lines.append(f"    - {item}")
-            output_lines.append("-" * 30)
-    else:
-        output_lines.append("No tag matches found.")
-        output_lines.append("-" * 30)
-
-    # Runbook section
-    output_lines.append(f"[RUNBOOK URL]     : {runbook_url}")
-
-    return "\n".join(output_lines)
+    return list(final_tags), grouped_details
 
 
 def send_slack_output(slack_output_dict, SLACK_WEBHOOK):
@@ -345,7 +345,14 @@ def send_slack_output(slack_output_dict, SLACK_WEBHOOK):
         print(f"⚠️ Error sending Slack message: {e}")
 
 
+# --- Main Execution Logic ---
 def lambda_handler(event, context):
+    # --- Select Incident ID ---
+    # incident_id = "Q0WVUWIXVOP2A8"  # Kafka example
+    # incident_id = "Q0J4J46HFZRNHF"   # Windows alert example
+    # incident_id = "Q3NERHR7A7W9H4"  # k8s alert example
+    # incident_id = "Q16HWF43U1YMGP" # No tag match example
+    # incident_id = "Q06VIQYR27094T" # Another example
 
     print("Received event:", json.dumps(event))
 
@@ -422,57 +429,67 @@ def lambda_handler(event, context):
 
         print(f"Using Incident ID: {incident_id} for processing...")
 
-        # Retrieve the incident data.
-        incident_data = get_incident(incident_id)
-        if incident_data is None or "incident" not in incident_data:
-            print("No incident data retrieved.")
+        # --- Load Filters ---
+        filters_file = "filters.yaml"
+        filters = None
+        if os.path.exists(filters_file):
+            try:
+                with open(filters_file, "r") as f:
+                    filters = yaml.safe_load(f)
+            except yaml.YAMLError as e:
+                print(f"Error loading YAML file '{filters_file}': {e}")
+                return
+            except FileNotFoundError:
+                print(f"Error: Filters file '{filters_file}' not found.")
+                return
+        else:
+            print(f"Error: Filters file '{filters_file}' not found.")
             return
-        incident = incident_data["incident"]
 
-        # Retrieve alerts for the incident.
-        alerts_data = get_incident_alerts(incident_id)
-        if alerts_data is None or "alerts" not in alerts_data:
-            print("No alerts data retrieved.")
-            return
-        alerts = alerts_data.get("alerts", [])
-
-        # Extract alert info from each alert (labels & additional details).
-        all_alerts_info = []
-        for alert in alerts:
-            alert_id = alert.get("id", "N/A")
-            labels, additional_details = extract_alert_info(alert)
-
-            alert_info = {
-                "alert_id": alert_id,
-                "labels": labels,
-                "incident_url": additional_details.get("incident_url", "N/A"),
-                "policy_url": additional_details.get("policy_url", "N/A"),
-                "severity": additional_details.get("severity", "N/A"),
-                "runbook_url": additional_details.get("runbook_url", "N/A"),
-                "condition_name": additional_details.get("condition_name", "N/A"),
-                "details": additional_details.get("details", "N/A"),
-            }
-
-            all_alerts_info.append(alert_info)
-
-        # print(all_alerts_info)
-        # Load filters from the YAML file.
-        filters_file_path = "filters.yaml"
-        filters = load_filters(filters_file_path)
         if not filters:
-            print("No filters loaded.")
+            print("Filters could not be loaded. Exiting.")
             return
 
-        # Process filters and get final tag set along with match details.
-        final_tags, match_details = process_filters_details(
-            incident, all_alerts_info, filters
+        # --- Retrieve Alerts ---
+        print(f"Fetching alerts for incident ID: {incident_id}")
+        alerts_data = get_incident_alerts(incident_id)
+
+        if alerts_data is None or "alerts" not in alerts_data:
+            print("Failed to retrieve alerts data or no alerts found.")
+            return
+
+        alerts = alerts_data.get("alerts", [])
+        if not alerts:
+            print("No alerts found for this incident.")
+            return
+
+        # --- Process Alerts ---
+        print("Processing alerts with filters...")
+        # Get tags and the dictionary grouped by tags
+        final_tags, grouped_key_value_details = process_alerts_with_filters(
+            alerts, filters
         )
 
-        # Print the output in a beautiful, presentable format.
-        slack_output = pretty_print_output(match_details, final_tags)
-        slack_message = format_output_for_slack(slack_output)
-        print(slack_message)
-        send_slack_output(slack_output, SLACK_WEBHOOK)
+        # --- Extract Additional Info (from the first alert) ---
+        # Assumes the most relevant general details are in the first alert
+        additional_details = extract_alert_info(alerts[0])
+
+        # --- Combine Results into Final Structure ---
+        final_details_section = (
+            grouped_key_value_details.copy()
+        )  # Start with tag-grouped KeyValues
+        final_details_section.update(
+            additional_details
+        )  # Add/overwrite with general details
+
+        final_output = {"tags": final_tags, "details": final_details_section}
+
+        send_slack_output(final_output, SLACK_WEBHOOK)
+
+        # --- Print Final JSON Output ---
+        # print("\n--- Final JSON Output ---")
+        # print(json.dumps(final_output, indent=4))
+        # print("-------------------------\n")
 
         # --- SUCCESS RESPONSE ---
         # Return a successful response to API Gateway
@@ -488,6 +505,7 @@ def lambda_handler(event, context):
                 }
             ),
         }
+
     except Exception as e:
         # Catch any unexpected errors during execution
         print(f"An unexpected error occurred: {e}")

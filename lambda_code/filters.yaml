@@ -3,7 +3,7 @@ on-prem-filtering:
   condition_type: input-tag
   filter-against:
     - title
-  values:
+  keys:
     - Onprem
     - onprem
     - Drivecam
@@ -24,7 +24,7 @@ cloud-filtering:
   condition_type: input-tag
   filter-against:
     - title
-  values:
+  keys:
     - aws
     - 802-testing
     - AddingPermissions-Test
@@ -571,7 +571,7 @@ k8s_filtering:
   condition_type: fetch-output-with-tag
   filter-against:
     - labels
-  values:
+  keys:
     - k8s.namespaceName
     - k8s.clusterName
     - k8s.deplyomentName
@@ -582,7 +582,7 @@ windows_filtering:
   condition_type: fetch-output-with-tag
   filter-against:
     - labels
-  values:
+  keys:
     - WindowsPlatform
     - instanceType
     - hostname
@@ -595,7 +595,7 @@ kafka_filtering:
   condition_type: fetch-output-with-tag
   filter-against:
     - labels
-  values:
+  keys:
     - aws.kafka.Topic
     - aws.kafka.ConsumerGroup
   tag: kafka-alert
