@@ -55,7 +55,7 @@ class PagerdutyWorkflowStack(Stack):
             handler="index.lambda_handler",
             role=role,
             layers=[dependencies_layer],
-            timeout=Duration.seconds(10)
+            timeout=Duration.seconds(10),
         )
 
         # API Gateway REST API
